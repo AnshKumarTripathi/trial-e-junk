@@ -39,6 +39,10 @@ class EbotNavigator(Node):
         self.POSITION_TOLERANCE = 0.3  # meters
         self.ORIENTATION_TOLERANCE = 10.0  # degrees
         
+        # Robot geometry
+        self.ROBOT_FRONT_OFFSET = 0.25  # Distance from center to front of robot (meters)
+        self.CLEARANCE_BUFFER = 0.4  # Extra clearance for intermediate waypoints (meters)
+        
         # Control parameters
         self.KP_LINEAR = 0.8
         self.KP_ANGULAR = 1.2
@@ -468,8 +472,24 @@ class EbotNavigator(Node):
         angle_diff = abs(self.normalize_angle(self.current_yaw - target_yaw))
         angle_diff_deg = math.degrees(angle_diff)
         
-        position_ok = distance <= self.POSITION_TOLERANCE
-        orientation_ok = angle_diff_deg <= self.ORIENTATION_TOLERANCE
+        # Use stricter tolerance for intermediate waypoints to ensure full clearance
+        # Intermediate waypoints are at odd indices (1, 3, 5...)
+        is_intermediate = waypoint_index % 2 == 1
+        
+        if is_intermediate:
+            # For intermediate waypoints, use tighter position tolerance
+            # This makes the robot travel closer/past the point before turning
+            # ensuring the entire robot body clears the corner
+            position_tolerance = 0.1  # Tighter tolerance (meters)
+            # More relaxed on final orientation for intermediate points
+            orientation_tolerance = self.ORIENTATION_TOLERANCE * 2
+        else:
+            # For main waypoints, use standard tolerances
+            position_tolerance = self.POSITION_TOLERANCE
+            orientation_tolerance = self.ORIENTATION_TOLERANCE
+        
+        position_ok = distance <= position_tolerance
+        orientation_ok = angle_diff_deg <= orientation_tolerance
         
         return position_ok and orientation_ok
 
