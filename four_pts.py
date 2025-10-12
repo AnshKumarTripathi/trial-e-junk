@@ -51,16 +51,22 @@ class EbotWallFollower(Node):
         self.lidar_data = None
         
         # Navigation state
-        self.state = "RUNNING"  # RUNNING, STOPPED, GOAL_REACHED
+        self.state = "NAVIGATE_TO_P1"  # NAVIGATE_TO_P1, WALL_FOLLOWING, STOPPED, GOAL_REACHED
         self.obstacle_front = False
         self.obstacle_right = False
         self.obstacle_left = False
+        self.p1_reached = False
+        
+        # P1 navigation parameters
+        self.P1_TOLERANCE = 0.5  # Distance to consider P1 reached
+        self.KP_LINEAR = 0.8
+        self.KP_ANGULAR = 1.2
         
         # Create timer for main control loop
         self.timer = self.create_timer(0.1, self.control_loop)
         
         self.get_logger().info("Ebot Wall Follower initialized")
-        self.get_logger().info("Algorithm: Right-wall following")
+        self.get_logger().info("Algorithm: Navigate to P1, then right-wall following")
 
     def lidar_callback(self, msg):
         """Process LiDAR data for obstacle detection"""
@@ -99,6 +105,56 @@ class EbotWallFollower(Node):
     def calculate_distance(self, x1, y1, x2, y2):
         """Calculate Euclidean distance between two points"""
         return math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+    
+    def normalize_angle(self, angle):
+        """Normalize angle to [-pi, pi]"""
+        while angle > math.pi:
+            angle -= 2 * math.pi
+        while angle < -math.pi:
+            angle += 2 * math.pi
+        return angle
+
+    def check_p1_reached(self):
+        """Check if P1 is reached"""
+        p1 = self.waypoints[0]
+        distance = self.calculate_distance(
+            self.current_x, self.current_y, p1[0], p1[1]
+        )
+        
+        if distance < self.P1_TOLERANCE:
+            self.get_logger().info(f"P1 reached! Distance: {distance:.2f}m")
+            return True
+        
+        return False
+
+    def navigate_to_p1(self):
+        """Simple navigation to reach P1 first"""
+        cmd = Twist()
+        
+        p1 = self.waypoints[0]
+        target_x, target_y = p1[0], p1[1]
+        
+        # Calculate distance and angle to P1
+        distance = self.calculate_distance(
+            self.current_x, self.current_y, target_x, target_y
+        )
+        
+        angle_to_target = math.atan2(target_y - self.current_y, target_x - self.current_x)
+        angle_error = self.normalize_angle(angle_to_target - self.current_yaw)
+        
+        self.get_logger().info(f"Navigating to P1 - Distance: {distance:.2f}m, Angle error: {math.degrees(angle_error):.1f}°")
+        
+        # Simple proportional control
+        if abs(angle_error) > 0.2:  # Need to turn
+            cmd.angular.z = self.KP_ANGULAR * angle_error
+            cmd.linear.x = 0.0
+            self.get_logger().info("Turning towards P1")
+        else:  # Move forward
+            cmd.linear.x = min(self.KP_LINEAR * distance, self.MAX_LINEAR_VEL)
+            cmd.angular.z = self.KP_ANGULAR * angle_error * 0.3
+            self.get_logger().info("Moving towards P1")
+        
+        return cmd
 
     def check_goal_reached(self):
         """Check if final goal (P3) is reached"""
@@ -191,17 +247,33 @@ class EbotWallFollower(Node):
             self.get_logger().warn("Waiting for LiDAR data...")
             return
         
-        # Execute wall-following algorithm
-        cmd = self.right_wall_following_algorithm()
+        # STATE 1: Navigate to P1 first
+        if self.state == "NAVIGATE_TO_P1":
+            # Check if P1 is reached
+            if self.check_p1_reached():
+                self.p1_reached = True
+                self.state = "WALL_FOLLOWING"
+                self.get_logger().info("P1 REACHED! Switching to wall-following mode")
+                return
+            
+            # Navigate towards P1
+            cmd = self.navigate_to_p1()
+            self.cmd_vel_pub.publish(cmd)
+            return
         
-        # Publish command
-        self.cmd_vel_pub.publish(cmd)
-        
-        # Log position
-        self.get_logger().info(
-            f"Position: ({self.current_x:.2f}, {self.current_y:.2f}, "
-            f"{math.degrees(self.current_yaw):.1f}°)"
-        )
+        # STATE 2: Wall-following mode (after P1 is reached)
+        if self.state == "WALL_FOLLOWING":
+            # Execute wall-following algorithm
+            cmd = self.right_wall_following_algorithm()
+            
+            # Publish command
+            self.cmd_vel_pub.publish(cmd)
+            
+            # Log position
+            self.get_logger().info(
+                f"Position: ({self.current_x:.2f}, {self.current_y:.2f}, "
+                f"{math.degrees(self.current_yaw):.1f}°)"
+            )
 
     def stop_robot(self):
         """Stop the robot"""
