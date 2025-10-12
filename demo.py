@@ -148,9 +148,9 @@ class EbotNavigator(Node):
             intermediate_waypoints.append(current)
             
             # Calculate intermediate waypoint
-            # Strategy: Move horizontally first, then vertically
-            intermediate_x = next_wp[0]  # Same x as next waypoint
-            intermediate_y = current[1]  # Same y as current waypoint
+            # Strategy: Move vertically first, then horizontally
+            intermediate_x = current[0]  # Same x as current waypoint
+            intermediate_y = next_wp[1]  # Same y as next waypoint
             intermediate_yaw = current[2]  # Keep current orientation
             
             intermediate_waypoint = [intermediate_x, intermediate_y, intermediate_yaw]
