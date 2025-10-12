@@ -76,6 +76,12 @@ class EbotNavigator(Node):
         self.collision_recovery_steps = 0
         self.max_recovery_steps = 10
         
+        # Greedy recovery when stuck
+        self.stuck_counter = 0
+        self.max_stuck_counter = 20
+        self.last_position = [0.0, 0.0]
+        self.greedy_mode = False
+        
         # Create timer for main control loop
         self.timer = self.create_timer(0.1, self.navigation_loop)
         
@@ -141,7 +147,10 @@ class EbotNavigator(Node):
         return angle
 
     def calculate_intermediate_waypoints(self):
-        """Calculate intermediate waypoints for safer navigation"""
+        """
+        Calculate intermediate waypoints for axis-by-axis navigation
+        For each waypoint transition, we align one axis first, then the other
+        """
         intermediate_waypoints = []
         
         for i in range(len(self.original_waypoints) - 1):
@@ -152,13 +161,19 @@ class EbotNavigator(Node):
             intermediate_waypoints.append(current)
             
             # Calculate intermediate waypoint
-            # Strategy: Move vertically first, then horizontally
-            intermediate_x = current[0]  # Same x as current waypoint
-            intermediate_y = next_wp[1]  # Same y as next waypoint
+            # Strategy: Align one axis at a time (Y first, then X)
+            # This ensures robot moves straight along one axis before turning
+            intermediate_x = current[0]  # Keep current X
+            intermediate_y = next_wp[1]  # Move to next Y
             intermediate_yaw = current[2]  # Keep current orientation
             
-            intermediate_waypoint = [intermediate_x, intermediate_y, intermediate_yaw]
-            intermediate_waypoints.append(intermediate_waypoint)
+            # Only add intermediate if there's actual movement
+            dx = abs(next_wp[0] - current[0])
+            dy = abs(next_wp[1] - current[1])
+            
+            if dx > 0.1 and dy > 0.1:  # Both axes change significantly
+                intermediate_waypoint = [intermediate_x, intermediate_y, intermediate_yaw]
+                intermediate_waypoints.append(intermediate_waypoint)
         
         # Add the final waypoint
         intermediate_waypoints.append(self.original_waypoints[-1])
@@ -333,11 +348,9 @@ class EbotNavigator(Node):
             self.get_logger().info("Obstacle in front and right, clear left - turning left")
             
         elif obstacles['front'] and obstacles['right'] and obstacles['left']:
-            # All directions blocked - stop permanently
-            cmd.linear.x = 0.0
-            cmd.angular.z = 0.0
-            self.state = "STOPPED"
-            self.get_logger().error("All directions blocked - stopping permanently")
+            # All directions blocked - don't stop if waypoints not completed
+            # Return None to trigger greedy mode
+            return None
             
         else:
             # Default case - move forward slowly
@@ -345,6 +358,79 @@ class EbotNavigator(Node):
             cmd.angular.z = 0.0
             
         return cmd
+
+    def greedy_navigation_to_waypoint(self, target_x, target_y, obstacles):
+        """
+        Greedy approach: Aggressively navigate towards waypoint
+        Used when stuck but waypoints not completed
+        """
+        cmd = Twist()
+        
+        # Calculate angle to target
+        angle_to_target = math.atan2(target_y - self.current_y, target_x - self.current_x)
+        angle_error = self.normalize_angle(angle_to_target - self.current_yaw)
+        
+        self.get_logger().warn("GREEDY MODE: Attempting to reach waypoint aggressively")
+        
+        # If completely blocked, try turning towards the most open direction
+        if obstacles['front'] and obstacles['right'] and obstacles['left']:
+            # Turn towards the direction with more clearance
+            if obstacles['left_dist'] > obstacles['right_dist']:
+                cmd.angular.z = self.MAX_ANGULAR_VEL  # Turn left
+                cmd.linear.x = 0.0
+                self.get_logger().warn("All blocked, turning LEFT (more clearance)")
+            else:
+                cmd.angular.z = -self.MAX_ANGULAR_VEL  # Turn right
+                cmd.linear.x = 0.0
+                self.get_logger().warn("All blocked, turning RIGHT (more clearance)")
+        
+        # If front blocked but sides open
+        elif obstacles['front']:
+            if not obstacles['left']:
+                cmd.angular.z = self.MAX_ANGULAR_VEL * 0.8  # Turn left
+                cmd.linear.x = 0.1
+                self.get_logger().warn("Front blocked, turning LEFT")
+            elif not obstacles['right']:
+                cmd.angular.z = -self.MAX_ANGULAR_VEL * 0.8  # Turn right
+                cmd.linear.x = 0.1
+                self.get_logger().warn("Front blocked, turning RIGHT")
+            else:
+                # Both sides blocked, turn towards target
+                cmd.angular.z = self.KP_ANGULAR * angle_error
+                cmd.linear.x = 0.0
+        
+        # If front is clear, move towards target
+        else:
+            # Align towards target
+            if abs(angle_error) > 0.2:
+                cmd.angular.z = self.KP_ANGULAR * angle_error
+                cmd.linear.x = self.MAX_LINEAR_VEL * 0.3
+            else:
+                cmd.linear.x = self.MAX_LINEAR_VEL * 0.5
+                cmd.angular.z = self.KP_ANGULAR * angle_error * 0.5
+        
+        return cmd
+    
+    def check_if_stuck(self):
+        """Check if robot is stuck (not moving)"""
+        distance_moved = self.calculate_distance(
+            self.last_position[0], self.last_position[1],
+            self.current_x, self.current_y
+        )
+        
+        if distance_moved < 0.05:  # Moved less than 5cm
+            self.stuck_counter += 1
+        else:
+            self.stuck_counter = 0
+        
+        # Update last position
+        self.last_position = [self.current_x, self.current_y]
+        
+        # Check if stuck for too long
+        if self.stuck_counter >= self.max_stuck_counter:
+            return True
+        
+        return False
 
     def navigation_loop(self):
         """Main navigation control loop with hybrid wall-following and waypoint navigation"""
@@ -363,13 +449,6 @@ class EbotNavigator(Node):
         # Get obstacle information
         obstacles = self.check_obstacle_surroundings()
         
-        # Check if we're completely surrounded
-        if obstacles['front'] and obstacles['right'] and obstacles['left']:
-            self.state = "STOPPED"
-            self.stop_robot()
-            self.get_logger().error("All directions blocked - stopping permanently")
-            return
-            
         # Get current target waypoint
         self.current_target_waypoint = self.get_next_target_waypoint()
         
@@ -382,6 +461,9 @@ class EbotNavigator(Node):
         if self.check_waypoint_reached_for_index(self.current_target_waypoint):
             self.mark_waypoint_completed(self.current_target_waypoint)
             self.get_logger().info(f"Waypoint {self.current_target_waypoint + 1} completed!")
+            # Reset stuck counter when waypoint reached
+            self.stuck_counter = 0
+            self.greedy_mode = False
             return
             
         # Determine navigation strategy
@@ -397,14 +479,44 @@ class EbotNavigator(Node):
         angle_to_target = math.atan2(target_y - self.current_y, target_x - self.current_x)
         angle_error = self.normalize_angle(angle_to_target - self.current_yaw)
         
+        # Check if robot is stuck
+        is_stuck = self.check_if_stuck()
+        
+        # If stuck and waypoints not completed, enable greedy mode
+        if is_stuck and len(self.completed_waypoints) < len(self.waypoints):
+            self.greedy_mode = True
+            self.get_logger().warn("Robot appears stuck! Enabling GREEDY MODE")
+        
         # Decision logic for navigation strategy
         cmd = Twist()
         
+        # GREEDY MODE: Use when stuck but waypoints not completed
+        if self.greedy_mode:
+            cmd = self.greedy_navigation_to_waypoint(target_x, target_y, obstacles)
+            self.state = "GREEDY_NAV"
+            
+            # Disable greedy mode after some movement
+            if self.stuck_counter < 5:
+                self.greedy_mode = False
+                self.get_logger().info("Robot moving again, disabling greedy mode")
+        
         # If obstacles are detected, use wall-following
-        if obstacles['front'] or obstacles['right']:
+        elif obstacles['front'] or obstacles['right']:
             self.state = "WALL_FOLLOWING"
             cmd = self.wall_following_navigation(obstacles)
-            self.get_logger().info("Using wall-following navigation")
+            
+            # If wall-following returns None (completely blocked), use greedy mode
+            if cmd is None:
+                if len(self.completed_waypoints) < len(self.waypoints):
+                    self.get_logger().warn("All directions blocked but waypoints incomplete! Using greedy mode")
+                    cmd = self.greedy_navigation_to_waypoint(target_x, target_y, obstacles)
+                    self.state = "GREEDY_NAV"
+                else:
+                    self.stop_robot()
+                    self.get_logger().error("All directions blocked - stopping")
+                    return
+            else:
+                self.get_logger().info("Using wall-following navigation")
             
         else:
             # Clear path - use waypoint navigation
@@ -452,6 +564,7 @@ class EbotNavigator(Node):
             f"({target_x:.2f}, {target_y:.2f}), "
             f"Dist: {distance_to_target:.2f}m, "
             f"State: {self.state}, "
+            f"Stuck: {self.stuck_counter}, "
             f"Completed: {len(self.completed_waypoints)}/{len(self.waypoints)}"
         )
 
